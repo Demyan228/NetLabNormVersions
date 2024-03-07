@@ -1,4 +1,11 @@
+from win32api import GetSystemMetrics
+###     LOG      ###
+debug = False
+
 ###    GUI    ###
+DW, DH = GetSystemMetrics(0), GetSystemMetrics(1) - 50
+indent = DW // 60
+
 FPS = 60
 
 ###   TRAIN   ###

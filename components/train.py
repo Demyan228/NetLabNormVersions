@@ -8,7 +8,6 @@ from functools import partial
 from typing import Optional
 
 
-
 class Trainer:
     _last_render_time = time()
     _is_running = True
@@ -25,19 +24,15 @@ class Trainer:
         Trainer.train_batches = hyperparams.get("train_batches", config.default_train_batches)
         Trainer.learning_rate = hyperparams.get("lr", config.default_lr)
 
-
     @staticmethod
     @es.subscribe('TRAIN_START_EVENT')
     async def run(model_data):
         Trainer.model = model_data["model"]
         asyncio.get_running_loop().create_task(Trainer.train())
 
-
     @staticmethod
     async def train():
         for i in range(Trainer.train_epochs):
-            if not Trainer._is_running:
-                break
             await Trainer.train_epoch()
             await es.ainvoke("EPOCH_DONE_EVENT", i)
         await es.ainvoke("TRAINER_QUIT_EVENT", {})
@@ -45,8 +40,6 @@ class Trainer:
     @staticmethod
     async def train_epoch():
         for i in range(Trainer.train_batches):
-            if not Trainer._is_running:
-                break
             with ProcessPoolExecutor() as pool:
                 loop = asyncio.get_running_loop()
                 train_batch = partial(Trainer.train_batch, Trainer.model)
@@ -60,11 +53,8 @@ class Trainer:
         info = sum(i for i in range(100_000_000))
         log("наконец закончила, очень устала")
 
-
-
     @staticmethod
     @es.subscribe('APP_QUIT_EVENT')
     async def quit_handler(event_data):
         Trainer._is_running = False
         log('TRAIN QUIT')
-
