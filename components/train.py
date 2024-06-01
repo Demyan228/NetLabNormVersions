@@ -1,79 +1,104 @@
 import asyncio
+from dataclasses import dataclass, field
 from time import time
 from common import log
 import config
-from event_system import EventSystem as es
-from concurrent.futures import ProcessPoolExecutor
+from event_system import EventSystem as es, EventTypes
+from concurrent.futures import ProcessPoolExecutor , ThreadPoolExecutor
 from functools import partial
-from typing import Optional
-import torch
+from components.backend.PyTorchBackend import PyTorchBackend
+from components.DataSet.CSV_Dataset import CSV_Dataset
+from torch.utils.data import DataLoader
 
 
 class NotInitializedError(Exception): ...
+ppe = ProcessPoolExecutor()
+
+
+@dataclass
+class History:
+    train_loss: list[float] = field(default_factory=list)
+    test_loss: list[float] = field(default_factory=list)
+    train_acc: float = 0
+    test_acc: float = 0
+
 
 class Trainer:
     _last_render_time = time()
     _is_running = True
-    max_delay = 1 / config.FPS
     train_epochs: int = 0
-    train_batches: int = 0
     learning_rate: int = 0
+    optimizer_type = None
+    optimizer = None
+    data_loader: DataLoader = None
+    loss_fn = None
     model = None
-    _is_initialized = False
+    _is_hyperparams_initialized = False
+    _is_dataset_initialized = False
+    _history = History()
 
     @staticmethod
-    @es.subscribe('SET_HYPERPARAMS')
+    @es.subscribe(EventTypes.SET_HYPERPARAMS)
     async def set_hyperparams(hyperparams):
-        Trainer.train_epochs = hyperparams.get("train_epochs", config.default_train_epochs)
-        Trainer.train_batches = hyperparams.get("train_batches", config.default_train_batches)
+        Trainer.train_epochs = hyperparams.get("num_epochs", config.default_train_epochs)
         Trainer.learning_rate = hyperparams.get("lr", config.default_lr)
-        Trainer._is_initialized = True
-
-
-    @staticmethod
-    def load_model(model_file_path):
-        model = torch.load(model_file_path)
-        log(model)
-        return model
-
+        Trainer.optimizer_type = PyTorchBackend.get_optimizer(hyperparams.get("optimizer", config.default_optimizer))
+        Trainer.loss_fn = PyTorchBackend.get_criterian(hyperparams.get("criterian", config.default_criterian))
+        Trainer._is_hyperparams_initialized = True
 
     @staticmethod
-    @es.subscribe('TRAIN_START_EVENT')
+    @es.subscribe(EventTypes.TRAIN_START)
     async def run(model_data):
-        if not Trainer._is_initialized:
-            raise NotInitializedError("call set_hyperparams before run")
-        Trainer.model = Trainer.load_model(model_data["model_file_path"])
+        if not Trainer._is_hyperparams_initialized:
+            raise NotInitializedError("  all set_hyperparams before run")
+        if not Trainer._is_dataset_initialized:
+            raise NotInitializedError("  dataset info not initialized before run")
+        Trainer.model = await PyTorchBackend.load_model(model_data["model_file_path"])
+        Trainer.optimizer = Trainer.optimizer_type(Trainer.model.parameters(), Trainer.learning_rate)
         asyncio.get_running_loop().create_task(Trainer.train())
 
     @staticmethod
     async def train():
+        t = time()
         for i in range(Trainer.train_epochs):
             if not Trainer._is_running:
                 break
-            await Trainer.train_epoch()
-            await es.ainvoke("EPOCH_DONE_EVENT", i)
-        await es.ainvoke("TRAINER_QUIT_EVENT", {})
+            loop = asyncio.get_running_loop()
+            train_epoch = partial(Trainer.train_epoch, Trainer.model, Trainer.loss_fn, Trainer.optimizer,
+                                  Trainer.data_loader)
+            t1 = loop.run_in_executor(ppe, train_epoch)
+            await t1
+            Trainer._history.train_loss.append(t1.result())
+            await es.ainvoke(EventTypes.EPOCH_DONE, {"history": Trainer._history})
+        log("train done for ", time() - t, "s")
+        await es.ainvoke(EventTypes.TRAINER_QUIT)
 
     @staticmethod
-    async def train_epoch():
-        for i in range(Trainer.train_batches):
+    def train_epoch(model, loss_fn, optimizer, data_loader):
+        sum_loss = 0
+        count = 0
+        sum_data_means = 0
+        for batch in data_loader:
             if not Trainer._is_running:
                 break
-            with ProcessPoolExecutor() as pool:
-                loop = asyncio.get_running_loop()
-                train_batch = partial(Trainer.train_batch, Trainer.model)
-                t1 = loop.run_in_executor(pool, train_batch)
-                await t1
-            await es.ainvoke("BATCH_DONE_EVENT", {"index": i})
+            batch_loss = PyTorchBackend.train_batch(model, batch, loss_fn, optimizer)
+            _, y = batch
+            sum_data_means += sum(y) / len(y)
+            sum_loss += batch_loss
+            count += 1
+        return sum_loss / count
 
     @staticmethod
-    def train_batch(model):
-        log(f"моделька ({model}) начала считать батч")
-        info = sum(i for i in range(100_000_000))
-        log("наконец закончила, очень устала")
+    @es.subscribe(EventTypes.SET_DATASET_PARAMS)
+    async def set_dataset_params(dataset_data):
+        dataset = CSV_Dataset(dataset_data["path"], dataset_data["target_column"])
+        Trainer.data_loader = DataLoader(dataset, batch_size=8, shuffle=True)
+        Trainer._is_dataset_initialized = True
+
 
     @staticmethod
-    @es.subscribe('APP_QUIT_EVENT')
+    @es.subscribe(EventTypes.APP_QUIT)
     async def quit_handler(event_data):
         Trainer._is_running = False
         log('TRAIN QUIT')
+
